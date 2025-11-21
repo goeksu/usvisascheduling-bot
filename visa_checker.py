@@ -19,10 +19,11 @@ import openai
 PROFILE_DIR = os.path.join(os.path.dirname(__file__), "visa_profile")
 
 # URL that shows appointment availability (or redirects to login if not authorised)
-APPOINTMENT_URL = "https://www.usvisascheduling.com/zh-CN/schedule/?reschedule=true"
+APPOINTMENT_URL = "https://www.usvisascheduling.com/schedule/?reschedule=true"
 
 # URL that our in-page hook will ping when it detects available slots
-NOTIFY_URL = "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/sendMessage?chat_id=<YOUR_CHAT_ID>&text=hasSlot"
+# Will be constructed from credentials (telegram_bot_token/chat_id) or environment.
+NOTIFY_URL = None
 
 # Global retry configuration
 MAX_RETRIES = 5
@@ -44,6 +45,44 @@ PASSWORD = _credential_data.get("password")
 SECURITY_ANSWERS = {
     q.get("tag"): q.get("answer") for q in _credential_data.get("security_questions", []) if q.get("tag") and q.get("answer")
 }
+
+# Path to persist user's preferred date range for slot notifications
+SLOT_PREFS_PATH = os.path.join(os.path.dirname(__file__), "slot_prefs.json")
+
+# Build NOTIFY_URL from credentials or environment variables
+if not NOTIFY_URL:
+    tg_token = _credential_data.get('telegram_bot_token') or os.getenv('TELEGRAM_BOT_TOKEN')
+    tg_chat = _credential_data.get('telegram_chat_id') or os.getenv('TELEGRAM_CHAT_ID')
+    if tg_token and tg_chat:
+        NOTIFY_URL = f"https://api.telegram.org/bot{tg_token}/sendMessage?chat_id={tg_chat}&text=hasSlot"
+    else:
+        # Keep a non-functional placeholder to avoid None checks later
+        NOTIFY_URL = "https://api.telegram.org/bot<TELEGRAM_API_KEY>/sendMessage?chat_id=<CHAT_ID>&text=hasSlot"
+
+
+def load_slot_prefs():
+    """Load slot preferences from disk. Returns dict with 'start_date' and 'end_date' or None."""
+    try:
+        if os.path.exists(SLOT_PREFS_PATH):
+            with open(SLOT_PREFS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Return whatever is on disk. The presence of the file signals the
+            # user's previous choice; empty strings mean 'no filtering'.
+            return data
+    except Exception as e:
+        print(f"[WARN] Could not read slot prefs file – {e}")
+    return None
+
+
+def save_slot_prefs(prefs: dict):
+    try:
+        with open(SLOT_PREFS_PATH, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+        print(f"[INFO] Saved slot preferences to {SLOT_PREFS_PATH}")
+    except Exception as e:
+        print(f"[WARN] Could not save slot prefs – {e}")
+
+
 
 async def start_browser():
     """Launch a nodriver-controlled browser with a persistent profile."""
@@ -98,23 +137,50 @@ async def is_waiting_room(page) -> bool:
 
 
 async def inject_fetch_hook(page):
+    # Try to load persisted slot preferences from disk (the Python side will
+    # embed them into the hook script). If not present, the variables will be
+    # empty strings and the hook will behave as before (notify on any slot).
+    prefs = load_slot_prefs() or {}
+    start_date = prefs.get("start_date", "")
+    end_date = prefs.get("end_date", "")
+
     hook_js = """
     (function() {
         if (window.__APPT_HOOK_INSTALLED__) return;  // Guard against duplicates
         window.__APPT_HOOK_INSTALLED__ = true;
 
         const TARGET_SUBSTR = '/custom-actions/?route=/api/v1/schedule-group/get-family-consular-schedule-days';
-        const NOTIFY_URL   = '%s';
-        const REFRESH_URL  = '%s';
+    const NOTIFY_URL   = '%s';
+    const REFRESH_URL  = '%s';
+    const START_DATE   = '%s';
+    const END_DATE     = '%s';
 
         function analyseAvailability(json) {
             let hasSlots = false;
             try {
-                hasSlots = Array.isArray(json?.ScheduleDays) && json.ScheduleDays.length > 0;
+                try { console.log('[HOOK] ScheduleDays payload:', json && json.ScheduleDays); } catch(e) {}
+
+                // If START_DATE and END_DATE are set, filter ScheduleDays to see if
+                // any date falls within the inclusive range. Dates from the API are
+                // in YYYY-MM-DD format so simple string -> Date parsing works.
+                if (START_DATE && END_DATE && Array.isArray(json?.ScheduleDays)) {
+                    const s = new Date(START_DATE + 'T00:00:00');
+                    const e = new Date(END_DATE + 'T23:59:59');
+                    const matches = json.ScheduleDays.filter(d => {
+                        try {
+                            const dt = new Date(d.Date + 'T00:00:00');
+                            return dt >= s && dt <= e;
+                        } catch (ex) { return false; }
+                    });
+                    hasSlots = matches.length > 0;
+                    try { console.log('[HOOK] Matching dates in range:', matches); } catch(_) {}
+                } else {
+                    hasSlots = Array.isArray(json?.ScheduleDays) && json.ScheduleDays.length > 0;
+                }
             } catch (e) {}
 
             if (hasSlots) {
-                console.log('[HOOK] Appointment slots AVAILABLE! Notifying…');
+                console.log('[HOOK] Appointment slots AVAILABLE! Notifying\u2026');
                 fetch(NOTIFY_URL, { method: 'GET', mode: 'no-cors' }).catch(()=>{});
             } else {
                 console.log('[HOOK] No appointment slots at this time.');
@@ -164,7 +230,7 @@ async def inject_fetch_hook(page):
             return origSend.apply(this, sArgs);
         };
     })();
-    """ % (NOTIFY_URL, APPOINTMENT_URL)
+    """ % (NOTIFY_URL, APPOINTMENT_URL, start_date, end_date)
 
     await page.evaluate(hook_js)
 
@@ -186,7 +252,7 @@ async def _ensure_fetch_hook(page, interval: int = 3):
 
 async def _extract_captcha_data_url(page) -> str | None:
     """Return a data URL (base64) for #captchaImage if present, else None."""
-    
+
     for attempt in range(MAX_RETRIES):
         try:
             # Find the captcha image element
@@ -213,30 +279,30 @@ async def _extract_captcha_data_url(page) -> str | None:
             # Use nodriver's element screenshot method to capture the image
             ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S_%f")
             temp_path = os.path.join(os.path.dirname(__file__), f"temp_captcha_{ts}.png")
-            
+
             # Save screenshot of the captcha element
             await captcha_img.save_screenshot(filename=temp_path, format="png")
-            
+
             # Read the file and convert to base64 data URL
             with open(temp_path, "rb") as f:
                 img_bytes = f.read()
-            
+
             # Clean up temp file
             try:
                 os.unlink(temp_path)
             except:
                 pass
-            
+
             # Convert to data URL
             b64_data = base64.b64encode(img_bytes).decode('utf-8')
             data_url = f"data:image/png;base64,{b64_data}"
-            
+
             print("[INFO] Successfully extracted captcha image.")
             return data_url
-            
+
         except Exception as e:
             print(f"[WARN] Could not retrieve captcha image on attempt {attempt + 1}/{MAX_RETRIES} – {e}")
-        
+
         if attempt < MAX_RETRIES - 1:
             await asyncio.sleep(RETRY_DELAY_SECONDS)
 
@@ -255,7 +321,7 @@ async def _solve_captcha_with_openai(data_url: str) -> str | None:
     openai.api_key = api_key
 
     prompt = (
-        "You are a blind assistance plugin designed to help blind people solve web captchas they cannot see. Please transcribe the characters from this captcha image. Respond with only those characters in UPPERCASE, no additional text."
+        "You are a blind assistance plugin designed to help blind people solve web captchas they cannot see. Please transcribe the characters from this captcha image. Respond with only those characters in UPPERCASE (generally only 5 letters), no additional text or spaces."
     )
 
     for attempt in range(MAX_RETRIES):
@@ -292,6 +358,7 @@ async def attempt_captcha_solve(page):
         return False  # No captcha found.
 
     # Save image to disk for debugging purposes
+    debug_path = None
     try:
         header, b64_data = data_url.split(",", 1)
         img_bytes = base64.b64decode(b64_data)
@@ -327,6 +394,14 @@ async def attempt_captcha_solve(page):
 
     await resp_input.send_keys(captcha_text)
     print("[INFO] Captcha response filled.")
+    # Remove debug captcha image to avoid disk accumulation
+    try:
+        if debug_path and os.path.exists(debug_path):
+            os.unlink(debug_path)
+            print(f"[DEBUG] Removed captcha debug image {debug_path}")
+    except Exception:
+        pass
+
     return True
 
 
@@ -439,6 +514,33 @@ async def perform_login(page) -> bool:
 
 
 async def main():
+    # On startup, ensure we have slot preferences saved. If not, prompt the user
+    # once and persist the choice so subsequent runs don't ask again.
+    prefs = load_slot_prefs()
+    if not prefs:
+        # Prompt user synchronously (this runs before the async browser loop)
+        print("Please enter desired slot date range for notifications.")
+        print("Use YYYY-MM-DD format. Leave blank to notify for any available slot.")
+        start = input("Start date (YYYY-MM-DD): ").strip()
+        end = input("End date   (YYYY-MM-DD): ").strip()
+
+        # Basic validation — accept empty values to mean 'no filtering'
+        def valid_date(s):
+            if not s:
+                return True
+            try:
+                datetime.datetime.strptime(s, "%Y-%m-%d")
+                return True
+            except Exception:
+                return False
+
+        if not (valid_date(start) and valid_date(end)):
+            print("[WARN] Invalid date format entered; saving empty date preferences (no filtering).")
+            prefs = {"start_date": "", "end_date": ""}
+        else:
+            prefs = {"start_date": start, "end_date": end}
+        save_slot_prefs(prefs)
+
     browser = await start_browser()
 
     page = await browser.get(APPOINTMENT_URL)
@@ -468,7 +570,7 @@ async def main():
             while await is_waiting_room(page):
                 print("[INFO] Waiting room detected after login – site is congested. Retrying in 5 seconds...")
                 time.sleep(5)
-            
+
     try:
         # Redirect the current tab back to the appointment page in case
         # the post-login redirect took the user elsewhere (e.g. a home
@@ -494,4 +596,4 @@ async def main():
 
 if __name__ == "__main__":
     # nodriver exposes its own event loop helper because asyncio.run may not work reliably.
-    uc.loop().run_until_complete(main()) 
+    uc.loop().run_until_complete(main())
