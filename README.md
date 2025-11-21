@@ -16,6 +16,8 @@ Please note that this bot is only applicable for regions using CGI platform for 
 
 -  **Appointment Monitoring**: Continuously monitors for available appointment slots
 
+-  **Slot Filtering**: Filter the slots for desired dates
+
 -  **Telegram Notifications**: Sends notifications when appointments become available
 
 -  **Session Persistence**: Maintains login sessions across runs using browser profiles
