@@ -1,3 +1,29 @@
+#  US Visa Scheduling Bot
+
+  
+An automated bot for monitoring US visa appointment availability and handling the login process for the US visa scheduling system.
+
+Please note that this bot is only applicable for regions using CGI platform for visa appointments.
+
+
+##  Features
+
+  
+
+-  **Automated Login**: Handles the two-step login process including username/password authentication and security questions
+
+-  **Captcha Solving**: Uses GPT-4o-mini to automatically solve captchas
+
+-  **Appointment Monitoring**: Continuously monitors for available appointment slots
+
+-  **Telegram Notifications**: Sends notifications when appointments become available
+
+-  **Session Persistence**: Maintains login sessions across runs using browser profiles
+
+-  **Waiting Room Handling**: Automatically handles high-traffic waiting rooms
+
+  
+
 ## Prerequisites
 
 - Python 3.8+ (or a compatible Python 3.x)
